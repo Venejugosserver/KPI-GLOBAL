@@ -560,6 +560,18 @@ const VJ = (function () {
     return ds.marcas.map((n, i) => ({ n, v: venta.get(i) || 0 })).sort((a, b) => b.v - a.v || a.n.localeCompare(b.n)).map(o => o.n);
   }
   const claveVend = n => ALIAS_VEND[norm(n)] || norm(n);
+  const codCli = c => String(c == null ? "" : c).trim().toUpperCase();
+  /* clientes con factura y monto positivo por marca: Map(índice de marca -> Set(índice de cliente)) */
+  function compradores(ds, filtro) {
+    const M = new Map();
+    ds.r.forEach(x => {
+      if ((x[8] || 0) !== TIPO_DOC.FACTURA || !(x[6] > 0) || (filtro && !filtro(x))) return;
+      if (!M.has(x[3])) M.set(x[3], new Set());
+      M.get(x[3]).add(x[0]);
+    });
+    return M;
+  }
+  const contarEn = (L, B) => { let n = 0; if (L && B) L.forEach(c => { if (B.has(c)) n++; }); return n; };
 
   function params(ds, cfg) {
     cfg = cfg || {};
@@ -588,19 +600,47 @@ const VJ = (function () {
        Marca sin ninguna cartera cargada: se usa la cartera total del asesor.
        Marca con al menos una cartera cargada: las vacías cuentan como 0 (el asesor no lleva la marca). */
     const CMV = cfg.carteraMarca || {}, QMV = cfg.cuotaMarcaVend || {};
-    const tieneCarteraMarca = m => !!(CMV[m] && Object.values(CMV[m]).some(hay));
+    /* Maestro de clientes por vendedor y marca: cfg.maestroVM = { VENDEDOR: { MARCA: [códigos] } }.
+       Una marca con al menos una lista se mide solo con listas: el vendedor sin lista en esa marca
+       tiene base 0, y un cliente está activado si está en la lista y compró la marca en el mes. */
+    const MVL = cfg.maestroVM || {};
+    const marcasLista = new Set();
+    Object.values(MVL).forEach(o => Object.keys(o || {}).forEach(m => { if (o[m] && o[m].length) marcasLista.add(m); }));
+    const tieneListaMarca = m => marcasLista.has(m);
+    const cacheL = {}, cacheU = {};
+    const listaVM = (m, nomV) => {
+      const k = claveVend(nomV), L = MVL[k] && MVL[k][m];
+      if (!L || !L.length) return null;
+      return cacheL[k + "|" + m] || (cacheL[k + "|" + m] = new Set(L.map(codCli)));
+    };
+    let idxCli = null;
+    const indiceCli = () => idxCli || (idxCli = new Map(ds.clientes.map((c, i) => [codCli(c), i])));
+    const aIdx = S => { const I = indiceCli(), out = new Set(); if (S) S.forEach(c => { const i = I.get(c); if (i != null) out.add(i); }); return out; };
+    const listaIdx = (m, nomV) => { const L = listaVM(m, nomV); return L ? aIdx(L) : null; };
+    const unionVM = m => {
+      if (!tieneListaMarca(m)) return null;
+      if (cacheU[m]) return cacheU[m];
+      const U = new Set(); Object.values(MVL).forEach(o => (o && o[m] || []).forEach(c => U.add(codCli(c))));
+      return (cacheU[m] = U);
+    };
+    const unionIdx = m => { const U = unionVM(m); return U ? aIdx(U) : null; };
+    const duenosVM = m => { const D = new Map(); Object.entries(MVL).forEach(([k, o]) => (o && o[m] || []).forEach(c => { c = codCli(c); D.set(c, (D.get(c) || []).concat(k)); })); return D; };
+    const tieneCarteraMarca = m => tieneListaMarca(m) || !!(CMV[m] && Object.values(CMV[m]).some(hay));
     const carteraMarcaVend = (m, nomV, iV) => {
       if (m == null || m === "TODAS") { const pv = vend(nomV, iV); return pv.cartera; }
+      if (tieneListaMarca(m)) { const L = listaVM(m, nomV); return L ? L.size : 0; }
       if (tieneCarteraMarca(m)) { const v = CMV[m][claveVend(nomV)]; return hay(v) ? num(v) : 0; }
       return vend(nomV, iV).cartera;
     };
-    const baseMarca = m => tieneCarteraMarca(m) ? Object.values(CMV[m]).filter(hay).reduce((a, v) => a + num(v), 0) : null;
+    const baseMarca = m => tieneListaMarca(m) ? unionVM(m).size
+      : tieneCarteraMarca(m) ? Object.values(CMV[m]).filter(hay).reduce((a, v) => a + num(v), 0) : null;
     const cuotaMarcaVend = (m, nomV, clave) => { const o = QMV[m] && QMV[m][claveVend(nomV)]; return o && hay(o[clave]) ? num(o[clave]) : null; };
     const feriados = (Array.isArray(cfg.feriados) ? cfg.feriados : String(cfg.feriados || "").split(/[,;\s]+/))
       .map(t => parseFecha(t)).filter(Boolean).map(fechaTxt);
     return {
       targetDef, foco, ranking: rk, marca, vend, feriados, fer: new Set(feriados),
       tieneCarteraMarca, carteraMarcaVend, baseMarca, cuotaMarcaVend,
+      hayListas: marcasLista.size > 0, tieneListaMarca, listaVM, listaIdx, unionVM, unionIdx, duenosVM, indiceCli,
       universo: num(cfg.universo) > 0 ? num(cfg.universo) : MAESTRO_DEF,
       medida: cfg.medida === "kg" ? "kg" : "usd", corte: cfg.corte || ""
     };
@@ -669,6 +709,8 @@ const VJ = (function () {
     });
     const volDe = A => med.i === 6 ? A.venta : A.kilos;
     const totalVenta = glob.venta;
+    /* con maestro por vendedor y marca, activado = cliente del maestro que compró la marca (a cualquier vendedor) */
+    const comprM = P.hayListas && zF < 0 ? compradores(ds, x => (kF < 0 || x[10] === kF)) : null;
 
     const fila = nombre => {
       const i = ds.marcas.indexOf(nombre);
@@ -678,12 +720,19 @@ const VJ = (function () {
       let uM = universo;
       if (vF >= 0) { if (P.tieneCarteraMarca(nombre)) uM = P.carteraMarcaVend(nombre, ds.vends[vF], vF); }
       else if (zF < 0) uM = pm.maestro || P.baseMarca(nombre) || universo;
-      const act = S.cli.size, pct = uM ? 100 * act / uM : 0;
+      let act = S.cli.size, fueraMaestro = null;
+      if (comprM && P.tieneListaMarca(nombre)) {
+        const B = comprM.get(i) || new Set();
+        const L = vF >= 0 ? (P.listaIdx(nombre, ds.vends[vF]) || new Set()) : P.unionIdx(nombre);
+        act = contarEn(L, B);
+        fueraMaestro = 0; (vF >= 0 ? S.cli : B).forEach(c => { if (!L.has(c)) fueraMaestro++; });
+      }
+      const pct = uM ? 100 * act / uM : 0;
       const req = Math.ceil(uM * pm.target / 100);
       const vol = volDe(S), cuota = pm[med.cuota];
       return {
         marca: nombre, foco: P.foco.indexOf(nombre) > -1,
-        activados: act, universo: uM, carteraMarca: uM !== universo, pct, target: pm.target, targetPropio: pm.propio,
+        activados: act, fueraMaestro, maestroLista: !!(comprM && P.tieneListaMarca(nombre)), universo: uM, carteraMarca: uM !== universo, pct, target: pm.target, targetPropio: pm.propio,
         requeridos: req, faltan: Math.max(0, req - act),
         cumpl: pm.target ? 100 * pct / pm.target : 100,
         vol, volProy: vol * factor, cuota,
@@ -780,13 +829,15 @@ const VJ = (function () {
       }
     });
 
+    const comprV = P.hayListas ? compradores(ds) : null;
+    const listaMk = mk !== "TODAS" && P.tieneListaMarca(mk);
     const vendedores = ds.vends.map((nom, i) => {
       if (vFil >= 0 && i !== vFil) return null;
       const pv = P.vend(nom, i);
       const atendida = atendidos[i] ? atendidos[i].size : 0;
       const cm = mk === "TODAS" ? null : P.carteraMarcaVend(mk, nom, i);
       const base = cm != null ? cm : (pv.cartera != null ? pv.cartera : atendida);
-      const act = activos[i] ? activos[i].size : 0;
+      const act = listaMk ? contarEn(P.listaIdx(mk, nom), comprV.get(mi)) : (activos[i] ? activos[i].size : 0);
       const meta = Math.round(base * tgt / 100);
       const faltan = Math.max(0, meta - act);
       return {
@@ -834,7 +885,7 @@ const VJ = (function () {
     /* por marca, para el alcance filtrado */
     const carteraTotal = v => { const i = ds.vends.indexOf(v.vendedor), pv = P.vend(v.vendedor, i); return pv.cartera != null ? pv.cartera : v.atendida; };
     const baseAlcance = vendedores.reduce((a, v) => a + carteraTotal(v), 0) || new Set(filas.map(x => x[0])).size;
-    const baseDeMarca = n => (vFil < 0 && P.marca(n).maestro) ? P.marca(n).maestro : P.tieneCarteraMarca(n) ? vendedores.reduce((a, v) => a + (P.carteraMarcaVend(n, v.vendedor, ds.vends.indexOf(v.vendedor)) || 0), 0) : baseAlcance;
+    const baseDeMarca = n => (vFil < 0 && P.marca(n).maestro) ? P.marca(n).maestro : (vFil < 0 && P.tieneListaMarca(n)) ? P.baseMarca(n) : P.tieneCarteraMarca(n) ? vendedores.reduce((a, v) => a + (P.carteraMarcaVend(n, v.vendedor, ds.vends.indexOf(v.vendedor)) || 0), 0) : baseAlcance;
     const actM = {}, volM = {};
     filas.forEach(x => {
       volM[x[3]] = (volM[x[3]] || 0) + x[med.i];
@@ -842,7 +893,11 @@ const VJ = (function () {
     });
     const porMarca = P.ranking.map(n => {
       const i = ds.marcas.indexOf(n), target = P.marca(n).target, bM = baseDeMarca(n);
-      const act = actM[i] ? actM[i].size : 0;
+      let act = actM[i] ? actM[i].size : 0;
+      if (comprV && P.tieneListaMarca(n)) {
+        const L = vFil >= 0 ? P.listaIdx(n, ds.vends[vFil]) : P.unionIdx(n);
+        act = contarEn(L, comprV.get(i));
+      }
       const meta = Math.round(bM * target / 100);
       const faltan = Math.max(0, meta - act);
       return {
@@ -893,14 +948,36 @@ const VJ = (function () {
         }
       }
     });
+    const conLista = mi >= 0 && P.tieneListaMarca(mk);
+    const L = !conLista ? null : vFil >= 0 ? (P.listaVM(mk, ds.vends[vFil]) || new Set()) : P.unionVM(mk);
+    const compr = conLista ? (compradores(ds, x => x[3] === mi).get(mi) || new Set()) : null;
     const lista = Array.from(mapa.values()).map(C => {
       C.activado = C.conFactura;
+      if (conLista) {
+        C.enMaestro = L.has(codCli(C.codigo));
+        C.activado = C.enMaestro && compr.has(P.indiceCli().get(codCli(C.codigo)));
+        C.estado = C.enMaestro ? (C.activado ? "activado" : "por activar") : (C.conFactura ? "fuera de maestro" : "sin compra");
+      }
       C.ultima = C.dia >= 0 ? ds.dias[C.dia] : "—";
       C.nMarcas = C.marcas.size;
       return C;
-    }).sort((a, b) => b.monto - a.monto || a.nombre.localeCompare(b.nombre));
+    });
+    if (conLista) {   /* clientes del maestro que no tienen movimiento con este alcance */
+      const vistos = new Set(lista.map(C => codCli(C.codigo))), I = P.indiceCli(), D = P.duenosVM(mk), nombres = (cfg && cfg.nombresCli) || {};
+      L.forEach(cod => {
+        if (vistos.has(cod)) return;
+        const i = I.get(cod), act = i != null && compr.has(i);
+        const dueno = vFil >= 0 ? ds.vends[vFil] : (D.get(cod) || []).join(", ");
+        lista.push({ codigo: cod, nombre: (i != null && (ds.clientesNom || [])[i]) || nombres[cod] || cod, ruc: i != null ? (ds.clientesRuc || [])[i] || "" : "",
+          vendedor: dueno, zona: "—", supervisor: vFil >= 0 ? P.vend(ds.vends[vFil], vFil).sup : ((D.get(cod) || [])[0] ? P.vend(D.get(cod)[0], null).sup : "—"), monto: 0, kilos: 0, montoTotal: 0, facturas: 0,
+          ultima: "—", nMarcas: 0, enMaestro: true, activado: act, estado: act ? "activado" : "por activar" });
+      });
+    }
+    if (conLista) for (let j = lista.length - 1; j >= 0; j--) if (lista[j].estado === "sin compra") lista.splice(j, 1);   /* ni en el maestro ni compró la marca */
+    lista.sort((a, b) => b.monto - a.monto || a.nombre.localeCompare(b.nombre));
     return {
-      marca: mk, vendedor: opt.vendedor || "TODOS", lista,
+      marca: mk, vendedor: opt.vendedor || "TODOS", lista, conMaestro: conLista,
+      maestro: conLista ? L.size : null, fueraMaestro: conLista ? lista.filter(c => c.estado === "fuera de maestro").length : null,
       activados: lista.filter(c => c.activado).length, atendidos: lista.length,
       kilos: lista.reduce((a, c) => a + c.kilos, 0), monto: lista.reduce((a, c) => a + c.monto, 0)
     };
@@ -1017,6 +1094,12 @@ const VJ = (function () {
 
     const nombres = new Set(Object.keys(porVend).map(Number));
     ds.vends.forEach((n, i) => { const pv = P.vend(n, i); if (pv[med.cuota] || pv.cartera) nombres.add(i); });
+    /* con maestro de la marca: compradores de la marca por semana (a cualquier vendedor), luego se cruzan con la lista de cada asesor */
+    const semLista = mi >= 0 && P.tieneListaMarca(mk) ? sem.map(() => new Set()) : null;
+    if (semLista) ds.r.forEach(x => {
+      if (x[3] !== mi || x[4] > iHasta || (x[8] || 0) !== TIPO_DOC.FACTURA || !(x[6] > 0)) return;
+      semLista[semanaDeDia(diaDelMes[x[4]])].add(x[0]);
+    });
 
     const filas = Array.from(nombres).map(i => {
       const nom = ds.vends[i], pv = P.vend(nom, i);
@@ -1024,7 +1107,8 @@ const VJ = (function () {
       const base = cmS != null ? cmS : (pv.cartera != null ? pv.cartera : 0);
       const metaCli = Math.round(base * tgt / 100), cuota = pv[med.cuota];
       if (!base && !cuota) return null;
-      const D = porVend[i] || { vol: sem.map(() => 0), cli: sem.map(() => new Set()) };
+      let D = porVend[i] || { vol: sem.map(() => 0), cli: sem.map(() => new Set()) };
+      if (semLista) { const L = P.listaIdx(mk, nom) || new Set(); D = { vol: D.vol, cli: semLista.map(S => new Set(Array.from(S).filter(c => L.has(c)))) }; }
       const vistos = new Set();
       let volAcum = 0;
       const semanas = sem.map((S, k) => {
@@ -1256,6 +1340,7 @@ const VJ = (function () {
     });
     const volDe = (A, m) => A ? (m.i === 6 ? A.us : A.kg) : 0;
     const universo = P.universo || 1;
+    const comprR = P.hayListas ? compradores(ds, x => x[4] <= iH && !fuera.has(x[3])) : null;
 
     /* subcategorías de la marca con detalle: las que tienen target; si ninguna, todas con el target por defecto */
     const esNestleDet = det > -1 && /NESTL/.test(ds.marcas[det]);
@@ -1292,7 +1377,8 @@ const VJ = (function () {
         const n = ds.marcas[mi], M = A ? A.marcas[mi] : null, pm = P.marca(n);
         const cartM = P.carteraMarcaVend(n, nom, i), bTot = P.baseMarca(n);
         const cuotaDirecta = P.cuotaMarcaVend(n, nom, mM.cuota);
-        const a = M ? M.act.size : 0;
+        const conLista = comprR && P.tieneListaMarca(n);
+        const a = conLista ? contarEn(P.listaIdx(n, nom), comprR.get(mi)) : (M ? M.act.size : 0);
         /* cuota: la cargada por asesor y marca; si no hay, la de la marca prorrateada por cartera */
         const cuotaM = cuotaDirecta != null ? cuotaDirecta
           : (pm[mM.cuota] ? pm[mM.cuota] * (bTot ? (cartM || 0) / bTot : cartera / universo) : 0);
@@ -1355,6 +1441,9 @@ const VJ = (function () {
     const A = aliasMarcas(cfg);
     if (cfg.marcas) Object.keys(cfg.marcas).forEach(k => { const t = A[norm(k)]; if (t) { if (!cfg.marcas[t]) cfg.marcas[t] = cfg.marcas[k]; delete cfg.marcas[k]; } });
     if (Array.isArray(cfg.foco)) cfg.foco = Array.from(new Set(cfg.foco.map(n => A[norm(n)] || n)));
+    ["carteraMarca", "cuotaMarcaVend"].forEach(c => { const o = cfg[c]; if (o) Object.keys(o).forEach(k => { const t = A[norm(k)]; if (t && t !== k) { o[t] = Object.assign({}, o[k], o[t] || {}); delete o[k]; } }); });
+    if (cfg.maestroVM) Object.values(cfg.maestroVM).forEach(o => Object.keys(o || {}).forEach(k => {
+      const t = A[norm(k)]; if (t && t !== k) { o[t] = Array.from(new Set((o[t] || []).concat(o[k]))); delete o[k]; } }));
     return cfg;
   }
 
@@ -1430,7 +1519,7 @@ const VJ = (function () {
   return {
     VERSION, TARGET_DEF, FOCO_N, CARTERAS, MAESTRO_DEF, MEDIDAS, medidaDe,
     norm, num, pack, params, ranking, compute, computeVend, clientesDe, rolling, semanal, semanasDelMes, cierre, diasCerrados, registrarCierres, fusionarHistorial, historialVacio, cargarHistorial, isoDe, parseFecha, reporteAsesores, TARGETS_SUB, cargarConfig, vigente, bloqueado, ultimoVigente, anularCierre, restaurarCierre, ALIAS_MARCA_DEF, aliasMarcas, nombreMarca, conAlias, migrarAlias,
-    narrativa, cargarDataset, configDe, sello, leerLocal, escribirLocal, borrarLocal, claveVend,
+    narrativa, cargarDataset, configDe, sello, leerLocal, escribirLocal, borrarLocal, claveVend, codCli, compradores, contarEn,
     f0, f1, fp, fu, diasHabiles, mapaColumnas, repararHoja, tiempos
   };
 })();
@@ -1560,7 +1649,7 @@ const VJ = (function () {
     const totalUs = filas.reduce((a,c)=>a+c.monto,0);
     return `<div class="tarjeta c12">
       <h3>Clientes activados · ${nomMarca(C.marca)}${C.vendedor === "TODOS" ? "" : " · " + C.vendedor}</h3>
-      <p class="sub">Activado = cliente con monto mayor a cero en la marca. ${f0(C.activados)} activados de ${f0(C.atendidos)} clientes con movimiento. La columna Marcas cuenta cuántas marcas distintas compró el cliente en el mes.</p>
+      <p class="sub">${C.conMaestro ? `Maestro de la marca${C.vendedor === "TODOS" ? "" : " del vendedor"}: ${f0(C.maestro)} clientes. Activado = cliente del maestro que compró la marca en el mes. ${f0(C.activados)} activados, ${f0(C.maestro - C.activados)} por activar${C.fueraMaestro ? " y " + f0(C.fueraMaestro) + " con compra fuera del maestro (no suman)" : ""}.` : `Activado = cliente con monto mayor a cero en la marca. ${f0(C.activados)} activados de ${f0(C.atendidos)} clientes con movimiento.`} La columna Marcas cuenta cuántas marcas distintas compró el cliente en el mes.</p>
       <div class="buscador no-print">
         <input id="qCli" type="text" placeholder="Buscar por cliente, RIF, código o vendedor" value="${FILTRO_TXT.replace(/"/g,"&quot;")}">
         <label style="font-size:.82rem;display:flex;align-items:center;gap:6px"><input type="checkbox" id="qAct" ${SOLO_ACT ? "checked" : ""}> Solo activados</label>
@@ -1573,7 +1662,7 @@ const VJ = (function () {
         <tbody>${filas.slice(0,400).map(c=>`<tr>
           <td><b>${c.nombre}</b></td><td>${c.ruc || "—"}</td><td>${c.codigo}</td><td>${c.vendedor}</td><td>${c.supervisor}</td>
           <td>${fu(c.monto)}</td><td>${f1(c.kilos)}</td><td>${f0(c.nMarcas)}</td><td>${f0(c.facturas)}</td><td>${c.ultima}</td>
-          <td><span class="pill ${c.activado ? "ok" : "mal"}">${c.activado ? "activado" : "sin compra"}</span></td></tr>`).join("")}</tbody>
+          <td><span class="pill ${c.activado ? "ok" : c.estado === "fuera de maestro" ? "med" : "mal"}">${c.estado || (c.activado ? "activado" : "sin compra")}</span></td></tr>`).join("")}</tbody>
       </table></div>
       ${filas.length > 400 ? `<p class="notas" style="margin-top:8px">Se muestran las primeras 400 filas de ${f0(filas.length)}; el CSV las trae todas.</p>` : ""}
     </div>`;
@@ -1593,7 +1682,7 @@ const VJ = (function () {
   function csvVista(){
     const C = VJ.clientesDe(DS, CFG, opt());
     const filas = C.lista.filter(c => SOLO_ACT ? c.activado : true).map(c =>
-      [c.ruc, c.codigo, c.nombre, c.vendedor, c.supervisor, c.zona, C.marca, n2(c.monto), n2(c.kilos), c.nMarcas, c.facturas, c.ultima, c.activado ? "ACTIVADO" : "SIN COMPRA"]);
+      [c.ruc, c.codigo, c.nombre, c.vendedor, c.supervisor, c.zona, C.marca, n2(c.monto), n2(c.kilos), c.nMarcas, c.facturas, c.ultima, (c.estado || (c.activado ? "activado" : "sin compra")).toUpperCase()]);
     bajar(`clientes_activados_${C.marca}_${C.vendedor}.csv`.replace(/\s+/g,"_"),
       csv(filas, ["RIF","Codigo","Cliente","Vendedor","Supervisor","Zona","Marca","Monto","Kilos","Marcas compradas","Facturas","Ultima compra","Estado"]));
   }
